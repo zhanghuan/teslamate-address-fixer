@@ -9,6 +9,7 @@ from typing import Optional, Dict
 from dataclasses import dataclass
 from datetime import datetime
 import json
+from math import radians, cos, sin, sqrt, atan2
 
 
 # Set up logging
@@ -34,6 +35,21 @@ class DBConfig:
             password=args.password,
             database=args.database
         )
+
+    def connect(self) -> psycopg.Connection:
+        try:
+            conn = psycopg.connect(
+                host=self.host,
+                port=self.port,
+                user=self.user,
+                password=self.password,
+                dbname=self.database
+            )
+            conn.autocommit = False
+            return conn
+        except Exception as e:
+            logger.error(f"Failed to connect to database: {e}")
+            raise
 
 @dataclass
 class TeslaMateAddress:
@@ -111,33 +127,41 @@ class TeslaMateAddress:
             logger.error(f"Error querying OpenStreetMap: {e}")
             return None
 
+    @classmethod
+    def from_address(cls, **address) -> 'TeslaMateAddress':
+        try:
+            inst = cls(latitude=address['latitude'], longitude=address['longitude'])
+            inst.display_name   = address['display_name']
+            inst.name           = address['name']
+            inst.house_number   = address['house_number']
+            inst.road           = address['road']
+            inst.neighbourhood  = address['neighbourhood']
+            inst.city           = address['city']
+            inst.county         = address['county']
+            inst.postcode       = address['postcode']
+            inst.state          = address['state']
+            inst.state_district = address['state_district']
+            inst.country        = address['country']
+            inst.raw            = address['raw']
+            inst.osm_id         = address['osm_id']
+            inst.osm_type       = address['osm_type']
+            return inst
+        except KeyError as e:
+            logger.error(f"Error creating TeslaMateAddress from address: {e}")
+            return None
+
 class TeslaMateAddressFixer:
     OSM_RESOLVE_INTERVAL = 1000
 
-    def __init__(self, db_config:DBConfig, proxy:Optional[str] = None, timeout:int = 5, dry_run:bool = False, verbose:bool = False):
-        self.db_config = db_config
+    def __init__(self, db_conn:psycopg.Connection, proxy:Optional[str] = None, timeout:int = 5, dry_run:bool = False, verbose:bool = False):
+        self.db_conn = db_conn
         self.proxy = proxy
         self.timeout = timeout
         self.dry_run = dry_run
         self.verbose = verbose
-        self.conn = None
-
-    def connect_db(self):
-        try:
-            self.conn = psycopg.connect(
-                host=self.db_config.host,
-                port=self.db_config.port,
-                user=self.db_config.user,
-                password=self.db_config.password,
-                dbname=self.db_config.database
-            )
-            self.conn.autocommit = False
-        except Exception as e:
-            logger.error(f"Failed to connect to database: {e}")
-            raise
 
     def _resolve_position_id(self, position_id:int) -> Optional[TeslaMateAddress]:
-        with self.conn.cursor() as cursor:
+        with self.db_conn.cursor() as cursor:
             cursor.execute(f"""
                 SELECT latitude, longitude 
                 FROM positions 
@@ -152,10 +176,10 @@ class TeslaMateAddressFixer:
                     return address
         return None
 
-    def fix_missing_addresses(self):
+    def execute(self):
         address = None
         try:
-            with self.conn.cursor() as cursor:
+            with self.db_conn.cursor() as cursor:
                 # Get drives with missing addresses
                 cursor.execute("""
                     SELECT id, start_address_id, start_position_id, end_address_id, end_position_id 
@@ -196,10 +220,10 @@ class TeslaMateAddressFixer:
                 logger.info(f"Fix charge #{charge_id}: ({address.latitude}, {address.longitude}) => {address.display_name}")
         except Exception as e:
             logger.error(f"Error updating address {address.display_name if address else 'unknown'}: {e}")
-            self.conn.rollback()
+            self.db_conn.conn.rollback()
 
     def _fix_drive_address(self, drive_id:int, type:str, address:TeslaMateAddress):
-        with self.conn.cursor() as cursor:
+        with self.db_conn.cursor() as cursor:
             address_id = self._query_or_add_address(cursor, address)
             if self.verbose:
                 logger.info(f"Update drive #{drive_id} {type} address {address.display_name}")
@@ -209,10 +233,10 @@ class TeslaMateAddressFixer:
                     SET {type}_address_id = {address_id}
                     WHERE id = {drive_id}
                 """)
-                self.conn.commit()
+                self.db_conn.conn.commit()
 
     def _fix_charge_address(self, charge_id:int, address:TeslaMateAddress):
-        with self.conn.cursor() as cursor:
+        with self.db_conn.cursor() as cursor:
             address_id = self._query_or_add_address(cursor, address)
             if self.verbose:
                 logger.info(f"Update charge #{charge_id} with address {address.display_name}")
@@ -222,7 +246,7 @@ class TeslaMateAddressFixer:
                     SET address_id = {address_id}
                     WHERE id = {charge_id}
                 """)
-                self.conn.commit()
+                self.db_conn.conn.commit()
 
     def _query_address(self, cursor, address:TeslaMateAddress) -> Optional[int]:
         cursor.execute(f"""
@@ -290,36 +314,131 @@ class TeslaMateAddressFixer:
             logger.info(f"Insert new address ({address.osm_id} {address.osm_type}): '{address.display_name}'")
         return self._insert_new_address(cursor, address)
 
+class TeslaMateFindNearbyAddresses:
+    def __init__(self, db_conn:psycopg.Connection, radius:int = 50):
+        self.db_conn = db_conn
+        self.radius = radius
+
+    def execute(self):
+        def _calculate_distance(address1, address2):
+            # Convert latitude and longitude from degrees to radians
+            lat1, lon1 = radians(address1.latitude), radians(address1.longitude)
+            lat2, lon2 = radians(address2.latitude), radians(address2.longitude)
+
+            # Haversine formula to calculate the distance
+            dlat = lat2 - lat1
+            dlon = lon2 - lon1
+            a = sin(dlat / 2)**2 + cos(lat1) * cos(lat2) * sin(dlon / 2)**2
+            c = 2 * atan2(sqrt(a), sqrt(1 - a))
+            radius_of_earth_m = 6371000  # in meters
+            distance = radius_of_earth_m * c
+
+            return distance
+
+        addresses = []
+        # get all addresses
+        with self.db_conn.cursor() as cursor:
+            cursor.execute("""
+                select
+                    latitude,
+                    longitude,
+                    display_name,
+                    name,
+                    house_number,
+                    road,
+                    neighbourhood,
+                    city,
+                    county,
+                    postcode,
+                    state,
+                    state_district,
+                    country,
+                    raw,
+                    osm_id,
+                    osm_type
+                from addresses
+            """)
+            for row in cursor:
+                address = TeslaMateAddress.from_address(
+                    latitude=row[0],
+                    longitude=row[1],
+                    display_name=row[2],
+                    name=row[3],
+                    house_number=row[4],
+                    road=row[5],
+                    neighbourhood=row[6],
+                    city=row[7],
+                    county=row[8],
+                    postcode=row[9],
+                    state=row[10],
+                    state_district=row[11],
+                    country=row[12],
+                    raw=row[13],
+                    osm_id=row[14],
+                    osm_type=row[15]
+                )
+                addresses.append(address)
+
+        # find nearby addresses
+        nearby_addresses = {}
+        for i, address in enumerate(addresses):
+            nearby_addresses[i] = []
+            for j, other_address in enumerate(addresses[i+1:]):
+                distance_m = _calculate_distance(address, other_address)
+                if distance_m <= self.radius:
+                    nearby_addresses[i].append((i + 1 + j, distance_m))
+
+        nearby_addresses_str = ''
+        for address_id, nearby_address_ids in nearby_addresses.items():
+            address = addresses[address_id]
+            if not nearby_address_ids:
+                continue
+
+            nearby_addresses_str += f"({address.latitude}, {address.longitude}): {address.display_name}\n"
+            for nearby_address_id, distance_m in nearby_address_ids:
+                nearby_address = addresses[nearby_address_id]
+                nearby_addresses_str += f"{distance_m:>8.2f}m  ({nearby_address.latitude}, {nearby_address.longitude}): {nearby_address.display_name}\n"
+            nearby_addresses_str += '\n'
+        logger.info(f"Found nearby addresses:\n{nearby_addresses_str}")
+
 def main(args):
     db_config = DBConfig.from_args(args)
+    db_conn = db_config.connect()
 
-    fixer = TeslaMateAddressFixer(db_config, args.proxy, args.timeout, args.dry_run, args.verbose)
-    fixer.connect_db()
-
-    try:
+    if args.cmd == 'fix':
+        fixer = TeslaMateAddressFixer(db_conn, args.proxy, args.timeout, args.dry_run, args.verbose)
         if args.interval:
             logger.info(f"Running in daemon mode with {args.interval} minute interval")
             while True:
-                fixer.fix_missing_addresses()
+                fixer.execute()
                 time.sleep(args.interval * 60)
         else:
-            fixer.fix_missing_addresses()
-    finally:
-        if fixer.conn:
-            fixer.conn.close()
+            fixer.execute()
+    elif args.cmd == 'find-nearby-addresses':
+        finder = TeslaMateFindNearbyAddresses(db_conn, args.radius)
+        finder.execute()
+    else:
+        raise ValueError(f"Unknown command: {args.cmd}")
+
+    db_conn.close()
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description='Fix TeslaMate missing addresses')
-    parser.add_argument('-H', '--host', type=str, default='127.0.0.1', dest='host', help='Database host')
-    parser.add_argument('-p', '--port', type=str, default='5432', dest='port', help='Database port')
-    parser.add_argument('-u', '--user', type=str, default='teslamate', dest='user', help='Database user')
-    parser.add_argument('-w', '--password', type=str, default='', dest='password', help='Database password')
-    parser.add_argument('-d', '--database', type=str, default='teslamate', dest='database', help='Database name')
-    parser.add_argument('-x', '--proxy', type=str, dest='proxy', help='HTTP proxy URL')
-    parser.add_argument('--timeout', type=int, default=5, dest='timeout', help='OSM request timeout')
-    parser.add_argument('--dry-run', default=False, action='store_true', dest='dry_run', help='Dry run mode')
-    parser.add_argument('--verbose', default=False, action='store_true', dest='verbose', help='Verbose mode')
-    parser.add_argument('--interval', type=int, dest='interval', help='Run interval in minutes (daemon mode)')
+    parser = argparse.ArgumentParser(description='TeslaMate address fixer')
+    db_args = argparse.ArgumentParser(add_help=False)
+    db_args.add_argument('-H', '--host', type=str, default='127.0.0.1', dest='host', help='Database host')
+    db_args.add_argument('-p', '--port', type=str, default='5432', dest='port', help='Database port')
+    db_args.add_argument('-u', '--user', type=str, default='teslamate', dest='user', help='Database user')
+    db_args.add_argument('-w', '--password', type=str, default='', dest='password', help='Database password')
+    db_args.add_argument('-d', '--database', type=str, default='teslamate', dest='database', help='Database name')
+    subparsers = parser.add_subparsers(dest='cmd')
+    parser_fix = subparsers.add_parser('fix', parents=[db_args,], help='Fix missing addresses')
+    parser_fix.add_argument('-x', '--proxy', type=str, dest='proxy', help='HTTP proxy URL')
+    parser_fix.add_argument('--timeout', type=int, default=5, dest='timeout', help='OSM request timeout')
+    parser_fix.add_argument('--dry-run', default=False, action='store_true', dest='dry_run', help='Dry run mode')
+    parser_fix.add_argument('--verbose', default=False, action='store_true', dest='verbose', help='Verbose mode')
+    parser_fix.add_argument('--interval', type=int, dest='interval', help='Run interval in minutes (daemon mode)')
+    parser_find_nearby_addresses = subparsers.add_parser('find-nearby-addresses', parents=[db_args,], help='Find nearby addresses')
+    parser_find_nearby_addresses.add_argument('-r', '--radius', type=int, default=50, dest='radius', help='Find nearby address radius in meters')
 
     args = parser.parse_args()
 
